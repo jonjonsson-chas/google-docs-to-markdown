@@ -5,63 +5,60 @@ const core = require("@actions/core");
 const matter = require("gray-matter");
 const TurndownService = require("turndown");
 
+const DOCUMENT_MIME_TYPE = "application/vnd.google-apps.document";
+const SPREADSHEET_MIME_TYPE = "application/vnd.google-apps.spreadsheet";
+
 async function main({ googleDriveFolderId, outputDirectoryPath }) {
-  const drive = google.drive({
-    auth: new google.auth.GoogleAuth({
-      scopes: ["https://www.googleapis.com/auth/drive.readonly"],
-    }),
-    version: "v3",
+  const auth = new google.auth.GoogleAuth({
+    scopes: [
+      "https://www.googleapis.com/auth/drive.readonly",
+      "https://www.googleapis.com/auth/spreadsheets.readonly",
+    ],
   });
+  const drive = google.drive({ auth, version: "v3" });
+  const sheets = google.sheets({ auth, version: "v4" });
 
-  const exportedFiles = await exportFiles({
-    drive,
-    files: await listFiles({ drive, googleDriveFolderId }),
-  });
+  const files = await listFiles({ drive, googleDriveFolderId });
 
-  await createDirectory({ outputDirectoryPath });
+  await createDirectory(outputDirectoryPath);
 
-  await writeExportedFiles({ exportedFiles, outputDirectoryPath });
-}
-
-async function createDirectory({ outputDirectoryPath }) {
-  await fsPromises.stat(outputDirectoryPath).catch((err) => {
-    if (err.code === "ENOENT") {
-      fsPromises.mkdir(outputDirectoryPath, { recursive: true });
+  for (const file of files) {
+    if (file.mimeType === SPREADSHEET_MIME_TYPE) {
+      await exportSpreadsheet({ sheets, file, outputDirectoryPath });
+    } else {
+      await exportDocument({ drive, file, outputDirectoryPath });
     }
-  });
+  }
 }
 
-async function exportFile({ drive, fileId }) {
-  const response = await drive.files.export({
-    fileId,
-    mimeType: "text/html",
-  });
-  return response.data;
+async function createDirectory(directoryPath) {
+  await fsPromises.mkdir(directoryPath, { recursive: true });
 }
 
-async function exportFiles({ drive, files }) {
-  return Promise.all(
-    files.map(async (file) => {
-      const html = await exportFile({
-        drive,
-        fileId: file.id,
-      });
-      return {
-        ...file,
-        html,
-      };
-    })
-  );
+function sanitizeFilename(name) {
+  return name.replace(/[\/\\]/g, "-");
 }
 
 async function listFiles({ drive, googleDriveFolderId }) {
   const response = await drive.files.list({
-    fields: "nextPageToken, files(id, name, createdTime, modifiedTime)",
+    fields: "nextPageToken, files(id, name, mimeType, createdTime, modifiedTime)",
     orderBy: "modifiedTime desc",
     pageSize: 1000,
-    q: `'${googleDriveFolderId}' in parents and mimeType = 'application/vnd.google-apps.document'`,
+    q: `'${googleDriveFolderId}' in parents and (mimeType = '${DOCUMENT_MIME_TYPE}' or mimeType = '${SPREADSHEET_MIME_TYPE}')`,
   });
   return response.data.files;
+}
+
+// --- Google Docs -> Markdown ---
+
+async function exportDocument({ drive, file, outputDirectoryPath }) {
+  const response = await drive.files.export({ fileId: file.id, mimeType: "text/html" });
+  const { body, title } = convertHtml(response.data);
+  const filename = sanitizeFilename(file.name);
+  await fsPromises.writeFile(
+    `${outputDirectoryPath}/${filename}.md`,
+    matter.stringify(body, { title })
+  );
 }
 
 function convertHtml(html) {
@@ -108,14 +105,40 @@ function convertHtml(html) {
   };
 }
 
-async function writeExportedFiles({ exportedFiles, outputDirectoryPath }) {
-  exportedFiles.forEach(async (exportedFile) => {
-    const { body, title } = convertHtml(exportedFile.html);
-    await fsPromises.writeFile(
-      `${outputDirectoryPath}/${exportedFile.name}.md`,
-      matter.stringify(body, { title })
-    );
+// --- Google Sheets -> CSV (one file per tab) ---
+
+async function exportSpreadsheet({ sheets, file, outputDirectoryPath }) {
+  const metadata = await sheets.spreadsheets.get({
+    spreadsheetId: file.id,
+    fields: "sheets.properties",
   });
+  const tabs = metadata.data.sheets.map((sheet) => sheet.properties);
+
+  const spreadsheetName = sanitizeFilename(file.name);
+  const spreadsheetDirectoryPath = `${outputDirectoryPath}/${spreadsheetName}`;
+  await createDirectory(spreadsheetDirectoryPath);
+
+  for (const tab of tabs) {
+    const valuesResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: file.id,
+      range: tab.title,
+    });
+    const csv = rowsToCsv(valuesResponse.data.values || []);
+    const tabName = sanitizeFilename(tab.title);
+    await fsPromises.writeFile(`${spreadsheetDirectoryPath}/${tabName}.csv`, csv);
+  }
+}
+
+function rowsToCsv(rows) {
+  return rows.map((row) => row.map(escapeCsvField).join(",")).join("\n");
+}
+
+function escapeCsvField(field) {
+  const value = field === undefined || field === null ? "" : String(field);
+  if (/[",\n]/.test(value)) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
 }
 
 main({
